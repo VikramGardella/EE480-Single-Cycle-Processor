@@ -1,0 +1,743 @@
+/*=======================================================================
+AIK Specification
+=======================================================================*/
+ad $.d, $.s, $.t := 0x0:4 .d:4 .s:4 .t:4
+al $.d, $.s, $.t := 0x1:4 .d:4 .s:4 .t:4
+an $.d, $.s, $.t := 0x2:4 .d:4 .s:4 .t:4
+dl $.d, $.s, $.t := 0x3:4 .d:4 .s:4 .t:4
+eo $.d, $.s, $.t := 0x4:4 .d:4 .s:4 .t:4
+or $.d, $.s, $.t := 0x5:4 .d:4 .s:4 .t:4
+sr $.d, $.s, $.t := 0x6:4 .d:4 .s:4 .t:4
+ml $.d, $.s, $.t := 0x7:4 .d:4 .s:4 .t:4
+li $.d, .i8 := 0x8:4 .d:4 .i8:8
+si $.d, .i8 := 0x9:4 .d:4 .i8:8
+la $.d, .i8 ?((.i8<=127)&&(.i8>=-128)) := 0x8:4 .d:4 .i8:8
+la $.d, .i8 := 0x8:4 .d:4 .i8>>8:8 0x9:4 .d:4 .i8:8
+br .c, .lab := 0xa:4 .c:4 .lab-(.+1):8
+lo $.d, $.s := 0xf:4 .d:4 .s:4 0x0:4
+mi $.d, $.s := 0xf:4 .d:4 .s:4 0x1:4
+nl $.d, $.s := 0xf:4 .d:4 .s:4 0x2:4
+no $.d, $.s := 0xf:4 .d:4 .s:4 0x3:4
+st $.d, $.s := 0xf:4 .d:4 .s:4 0x4:4
+cl $.s, $.t := 0xf:4 .s:4 .t:4 0x5:4
+co $.s, $.t := 0xf:4 .s:4 .t:4 0x6:4
+jr .c, $.d := 0xf:4 .c:4 .d:4 0x7:4
+sy := 0xf:4 0xf:4 0xf:4 0xf:4
+.const { zero	sp fp ra rv u10 u9 u8 u7 u6 u5 u4 u3 u2 u1 u0 }
+.const { f lt le eq ne ge gt t }
+.segment .text 16 0x10000 0 .VMEM
+.segment .data 16 0x10000 0 .VMEM
+.const 0 .lowfirst
+/*=======================================================================
+END AIK
+=======================================================================*/
+/*=======================================================================
+pipe.v
+=======================================================================*/
+
+// basic sizes of things
+`define WORD       [15:0]
+`define Opcode     [15:12]
+`define XOP        [3:0]
+`define DEST       [11:8]
+`define c          [11:8]
+`define i8         [7:0]
+`define lab        [7:0]
+`define Src        [7:4]
+`define RNAME      [7:4]
+`define OP		     [3:0]
+`define REGSIZE    [15:0]
+`define MEMSIZE    [255:0]
+
+//conditional flags
+`define f    4'b0000
+`define lt   4'b0001
+`define le   4'b0010
+`define eq   4'b0011
+`define ne   4'b0100
+`define ge   4'b0101
+`define gt   4'b0110
+`define t    4'b0111
+
+// opcode values, also state numbers
+`define OPad  4'b0000
+`define OPal  4'b0001
+`define OPan  4'b0010
+`define OPdl  4'b0011
+`define OPeo  4'b0100
+`define OPor  4'b0101
+`define OPsr  4'b0110
+`define OPml  4'b0111
+`define OPli  4'b1000
+`define OPsi  4'b1001
+`define OPbr  4'b1010
+`define OPsy  4'b1111
+
+// two register opcode
+`define OPlo  4'b0000
+`define OPmi  4'b0001
+`define OPnl  4'b0010
+`define OPno  4'b0011
+`define OPst  4'b0100
+`define OPcl  4'b0101
+`define OPco  4'b0110
+`define OPjr  4'b0111
+
+// nop
+`define OPnop	   16'b0
+
+// state numbers
+`define Start    4'b1111
+`define Start1    4'b1110
+
+//decode
+module decode(opout, regdst, opin, ir);
+output reg `OP opout;
+output reg `RNAME regdst;
+input wire `OP opin;
+input `WORD ir;
+
+//need to decode lo,mi,no,st,co, jr, sy; all share opcode 4’b1111
+always @(opin, ir) begin
+  if (ir `Opcode == `OPlo) begin
+    case (ir `OP)
+	     4'b0000: opout = `OPlo;
+	     4'b0001: opout = `OPmi;
+	     4'b0010: opout = `OPnl;
+	     4'b0011: opout = `OPno;
+	     4'b0100: opout = `OPst;
+	     4'b0101: opout = `OPcl;
+     	     4'b0110: opout = `OPco;
+      	     4'b0111: opout = `OPjr;
+                 default: opout = `OPsy;
+    endcase
+    end else begin
+    opout = opin;
+    end
+  end
+endmodule
+
+module processor(halt, reset, clk);
+output reg halt;
+input reset, clk;
+
+reg `WORD regfile `REGSIZE;
+reg `WORD mainmem `MEMSIZE;
+reg squash;
+reg `WORD pc = 0;
+reg `WORD ir, srcval, dstval, newpc;
+reg `OP s = `Start;
+wire `OP op;
+wire `DEST regdst;
+wire `WORD res;
+reg `OP s0op, s1op, s2op;
+reg `DEST s0src, s0dst, s0regdst, s1regdst, s2regdst;
+reg `WORD s1srcval, s1dstval;
+reg `WORD s2val;
+reg islt, isgt, cond;
+integer a;
+
+always @(reset) begin
+  halt = 0;
+  pc = 0;
+  newpc = 0;
+  s = `Start;
+  regfile[0] = 0;
+  mainmem[0] = 0;
+  s0op = `OPnop;		// these seem to be operations for 3 stages
+  s1op = `OPnop;
+  s2op = `OPnop;
+  $readmemh0(regfile);
+  $readmemh1(mainmem);
+end
+
+// decode condition
+always @(islt or isgt or ir) begin	// islt and isgt will be set by co
+  case (ir `c)
+  `f: cond = 0;
+  `lt: cond = islt;
+  `le: cond = !isgt;
+  `eq: cond = !(islt | isgt);
+  `ne: cond = (islt | isgt);
+  `ge: cond = !islt;
+  `gt: cond = isgt;
+  `t: cond = 1;
+  endcase
+end
+
+decode mydecode(op, regdst, s0op, ir);
+alu myalu(res, s1op, s1srcval, s1dstval);
+
+always @(*) ir = mainmem[pc];
+
+// Determine pc value
+always @(*) begin
+    if (s1dstval == 0) newpc = pc;
+    case (s1op)
+        `OPjr: if (cond) newpc = regfile[s1srcval];
+        `OPbr: if (cond) newpc = (regfile[ir `lab]) + (pc + 1);
+        default: newpc = pc + 1;
+    endcase
+end
+
+// squash?
+always @(*) squash = (((s1op == `OPjr)||(s1op == `OPbr)) && (s1dstval == 0));
+
+// Instruction Fetch
+always @(posedge clk) if (!halt) begin
+  s0op <= (squash ? `OPnop : op);
+  s0regdst <= (squash ? 0 : regdst);
+  s0src <= ir `Src;
+  s0dst <= ir `DEST;
+  pc <= newpc;
+end
+
+// compute srcval, with value forwarding... also from 2nd word of li
+always @(*) if (s0op == `OPli) srcval = ir; // catch immediate for li
+            else srcval = ((s1regdst && (s0src == s1regdst)) ? res :
+                           ((s2regdst && (s0src == s2regdst)) ? s2val :
+                            regfile[s0src]));
+
+// compute dstval, with value forwarding
+always @(*) dstval = ((s1regdst && (s0dst == s1regdst)) ? res :
+                      ((s2regdst && (s0dst == s2regdst)) ? s2val :
+                       regfile[s0dst]));
+
+// Register Read
+always @(posedge clk) if (!halt) begin
+  s1op <= (squash ? `OPnop : s0op);
+  s1regdst <= (squash ? 0 : s0regdst);
+  s1srcval <= srcval;  
+  s1dstval <= dstval;
+end
+
+// ALU and data memory operations
+always @(posedge clk) if (!halt) begin
+  s2op <= s1op;
+  s2regdst <= s1regdst;
+  s2val <= ((s1op == `OPlo) ? mainmem[s1srcval] : res);
+  if (s1op == `OPst) mainmem[s1srcval] <= s1dstval;
+  if (s1op == `OPsy) halt <= 1;
+end
+
+// Register Write
+always @(posedge clk) if (!halt) begin
+  if (s2regdst != 0) regfile[s2regdst] <= s2val;
+end
+
+endmodule //end processor module
+
+module alu(result, op, in1, in2);
+output reg `WORD result;
+reg islt, isgt;
+input wire `OP op;
+input wire `WORD in1, in2;
+
+always @(op, in1, in2) begin
+  case (op)
+    `OPad: begin result = in1 + in2; end
+    `OPan: begin result = in1 & in2; end
+    `OPeo: begin result = in1 ^ in2; end
+    `OPor: begin result = in1 | in2; end
+    `OPsr: begin result = in1 >> in2; end
+    `OPmi: begin result = 0 - in2; end //don't know if it should be in2 or in1
+    `OPno: begin result = !in2; end //don't know if it should be in2 or in1
+    `OPco: begin if(in1 < in2) islt = 1; else if(in1 > in2) isgt = 1; end
+    default: begin result = in1; end
+  endcase
+end
+endmodule
+
+//testbench
+module testbench;
+reg reset = 0;
+reg clk = 0;
+wire halted;
+integer i = 0;
+processor PE(halted, reset, clk);
+initial begin
+  $dumpfile;
+  $dumpvars(0, PE);
+  #10 reset = 1;
+  #10 reset = 0;
+  while (!halted && (i < 200)) begin
+    #10 clk = 1;
+    #10 clk = 0;
+    i=i+1;
+  end
+  $finish;
+end
+endmodule
+/*=======================================================================
+END pipe.v
+=======================================================================*/
+
+module processor(halt, reset, clk);
+output reg halt;
+input reset, clk;
+
+reg `WORD regfile `REGSIZE;
+reg `WORD mainmem `MEMSIZE;
+reg `WORD pc = 0;
+reg `WORD ir;
+reg `STATE s = `Start;
+reg f  =  1'b0;
+reg lt =  1'b0;
+reg le =  1'b0;
+reg eq =  1'b0;
+reg ne =  1'b0;
+reg ge =  1'b0;
+reg gt =  1'b0;
+reg t  =  1'b1;
+integer a;
+
+always @(reset) begin
+  halt = 0;
+  pc = 0;
+  s = `Start;
+  $readmemh0(regfile);
+  $readmemh1(mainmem);
+end
+
+always @(posedge clk) begin
+$display("s=", s);
+  case (s)
+    `Start: begin ir <= mainmem[pc]; s <= `Start1; $display("pc=", pc); end
+    `Start1: begin
+             pc <= pc + 1;
+             eq <= 0;
+             lt <= 0;
+             gt <= 0;
+             case(ir `Opcode)
+             `OPreg:
+                case(ir `XOP)
+                  `OPlo: begin regfile[ir `Dest] <= mainmem[ir `Src]; s <= `Start; end
+                  `OPmi: begin regfile[ir `Dest] <= 0 - regfile[ir `Src]; s <= `Start; end
+                  `OPno: begin regfile[ir `Dest] <= !regfile[ir `Src]; s <= `Start; end
+                  `OPst: begin mainmem[regfile[ir `Src]] <= regfile[ir `Dest]; s <= `Start; end
+                  `OPco: begin if (regfile[ir `Dest] == regfile[ir `Src]) eq <= 1;
+                    else if (regfile[ir `Dest] < regfile[ir `Src]) lt <= 1;
+                    else if (regfile[ir `Dest] > regfile[ir `Src]) gt <= 1;
+                    s <= `Start; end
+                  `OPjr: begin if (regfile[ir `Dest]) pc <= regfile[ir `Src]; s <= `Start; end
+                  default: s <= ir `Opcode;
+                endcase
+                default: s <= ir `Opcode; // most instructions, state # is opcode
+                endcase
+               end
+    `OPad: begin regfile[ir `Dest] <= regfile[ir `Src] + regfile[ir `XOP]; s <= `Start; end
+    `OPan: begin regfile[ir `Dest] <= regfile[ir `Src] & regfile[ir `XOP]; s <= `Start; end
+    `OPeo: begin regfile[ir `Dest] <= regfile[ir `Src] ^ regfile[ir `XOP]; s <= `Start; end
+    `OPor: begin regfile[ir `Dest] <= regfile[ir `Src] | regfile[ir `XOP]; s <= `Start; end
+    `OPsr: begin regfile[ir `Dest] <= regfile[ir `Src] >> regfile[ir `XOP]; s <= `Start; end
+    `OPli: begin regfile[ir `Dest] <= regfile[ir `i8] >>> 8; s <= `Start; end
+    `OPsi: begin regfile[ir `Dest] <= (regfile[ir `Dest] << 8) | (regfile[ir `i8] & (8'b11111111)); s <= `Start; end
+    `OPbr:
+      case (ir `c)
+        `t: begin pc <= regfile[ir `i8] + (pc+1); s <= `Start; end
+        `lt: begin if (lt == 1) pc <= ((regfile[ir `lab])+(pc+1)); s <= `Start; end
+        `le: begin if (le == 1) pc <= ((regfile[ir `lab])+(pc+1)); s <= `Start; end
+        `eq: begin if (eq == 1) pc <= ((regfile[ir `lab])+(pc+1)); s <= `Start; end
+        `ge: begin if (ge == 1) pc <= ((regfile[ir `lab])+(pc+1)); s <= `Start; end
+        `gt: begin if (gt == 1) pc <= ((regfile[ir `lab])+(pc+1)); s <= `Start; end
+        `ne: begin if (ne == 1) pc <= ((regfile[ir `lab])+(pc+1)); s <= `Start; end
+        `f: begin s <= `Start; end
+        default: s <= ir `Opcode;
+      endcase
+    default: halt <= 1;
+  endcase
+end
+endmodule
+
+
+
+//generated by AIK version 20070512
+@0000
+8f01
+8e04
+8d05
+0fed
+f9f6
+a301
+ffff
+8f01
+8e05
+8d0f
+2fed
+f5f6
+a301
+ffff
+8f01
+8e05
+8d0f
+4fed
+faf6
+a301
+ffff
+8f01
+8e05
+8d0f
+5fed
+fff6
+a301
+ffff
+8f01
+8e01
+8d03
+6fed
+f8f6
+a301
+ffff
+8f01
+8e04
+ffe0
+f4f6
+a301
+ffff
+8f01
+8e04
+8d05
+0fed
+f9f6
+a301
+ffff
+8f01
+8e04
+ffe1
+fcf6
+a301
+ffff
+8f01
+8e04
+ffe3
+fbf6
+a301
+ffff
+8f01
+8e04
+ffe4
+f1e6
+a301
+ffff
+8f01
+8e04
+8d05
+0fed
+f5f6
+a501
+ffff
+ffff
+//end
+
+
+start:
+    li $u0,1
+    li $u1,4
+    li $u2,5
+    ad $u0,$u1,$u2
+    co $9,$u0
+    br eq, A
+    sy
+A:
+    li $u0,1
+    li $u1,5
+    li $u2,15
+    an $u0,$u1,$u2
+    co $5,$u0
+    br eq, B
+    sy
+B:
+    li $u0,1
+    li $u1,5
+    li $u2,15
+    eo $u0,$u1,$u2
+    co $10,$u0
+    br eq, C
+    sy
+C:
+    li $u0,1
+    li $u1,5
+    li $u2,15
+    or $u0,$u1,$u2
+    co $15,$u0
+    br eq, D
+    sy
+D:
+    li $u0,1
+    li $u1,1
+    li $u2,3
+    sr $u0,$u1,$u2
+    co $8,$u0
+    br eq, E
+    sy
+E:
+    li $u0,1
+    li $u1,4
+    lo $u0,$u1
+    co $4,$u0
+    br eq, F
+    sy
+F:
+    li $u0,1
+    li $u1,4
+    li $u2,5
+    ad $u0,$u1,$u2
+    co $9,$u0
+    br eq, G
+    sy
+G:
+    li $u0,1
+    li $u1,4
+    mi $u0,$u1
+    co $-4,$u0
+    br eq, H
+    sy
+H:
+    li $u0,1
+    li $u1,4
+    no $u0,$u1
+    co $11,$u0
+    br eq, I
+    sy
+I:
+    li $u0,1
+    li $u1,4
+    st $u0,$u1
+    co $1,$u1
+    br eq, K
+    sy
+K:
+    li $u0,1
+    li $u1,4
+    li $u2,5
+    ad $u0,$u1,$u2
+    co $5,$u0
+    jr ge, L
+    sy
+L:
+    Sy
+
+
+**************************************************************************************************************************************************************************************************************************
+//Alex Polus, Najwa Abu-Taha, Greg McIntosh
+//Assignment 2 - Multi-Cycle Logick
+//10.4.2017
+
+/*	Begin Code	*/
+
+// basic sizes
+`define WORD	[15:0]
+`define Opcode	[15:12]
+`define regdiff[11:8] //must change from '2regdiff' to something else
+`define i8	[7:0]
+//`define lab	//?
+`define dotc	[11:8]
+
+`define REGSIZE [15:0]
+`define MEMSIZE [65535:0]
+
+// opcode values
+`define OPad	4'b0000
+`define OPan	4'b0010
+`define OPeo	4'b0100
+`define OPor	4'b0110
+`define OPsr	4'b0111
+
+`define OP2reg	4'b1000
+
+/*op diff codes need to go here*/
+//didn't define them actually, made a case statement below
+
+`define OPli	4'b1001
+`define OPsi	4'b1010
+`define OPbr	4'b1011
+`define OPco	4'b1100
+/*^ dont worry about this diff code cause cl isn't in this program*/
+`define OPjr	4'b1101
+`define OPsy	4'b1110
+
+//special opcode for the conditin that advances the program
+`define OPadvance 4'b1111
+
+//define two one-bit registers for comparison values?
+
+/*	Logick Processor Module		*/
+module processor(halt, reset, clk);
+output reg halt;
+input reset, clk;
+
+reg `WORD regfile `REGSIZE;
+reg `WORD mainmem `MEMSIZE;
+reg `WORD pc = 0;
+reg `WORD ir;
+reg [3:0] s;
+reg [3:0] regdiff;
+reg [3:0] dotc;
+//reg `Opcode opcode; I don't think we need this
+//integer a;???
+reg temp[3:0];
+
+//create condition registers...
+reg lt = 1'b0;
+reg le = 1'b0;
+reg ne = 1'b0;
+reg eq = 1'b0;
+reg ge = 1'b0;
+reg gt = 1'b0;
+//condition code true/false register ---- where do we set this???
+reg f = 1'b0;
+reg t = 1'b1;
+//reg truefalse = 1'b0;
+wire `WORD extimm;
+
+assign extimm = ir[7:0];
+
+always @(reset) begin
+  halt = 0;
+  pc = 0;
+  s = `OPadvance;
+  $readmemh0(regfile);
+  $readmemh1(mainmem);
+end
+
+always @(posedge clk) begin
+  case (s)
+	//initiation / advance function
+	`OPadvance:
+		begin 
+			ir = mainmem[pc];
+			pc <= pc + 1;
+			s <= ir `Opcode;
+		end
+
+	`OPad: begin regfile[ir [11:8]] <= regfile[ir [7:4]] + regfile[ir [3:0]]; s <= `OPadvance; end
+	`OPan: begin regfile[ir [11:8]] <= regfile[ir [7:4]] & regfile[ir [3:0]]; s <= `OPadvance; end
+	`OPeo: begin regfile[ir [11:8]] <= regfile[ir [7:4]] ^ regfile[ir [3:0]]; s <= `OPadvance; end
+	`OPor: begin regfile[ir [11:8]] <= regfile[ir [7:4]] | regfile[ir [3:0]]; s <= `OPadvance; end
+	`OPsr: begin regfile[ir [11:8]] <= regfile[ir [7:4]] >> regfile[ir [3:0]]; s <= `OPadvance; end
+
+	`OP2reg:	/*Here we need another case statement for diffops*/
+		begin
+		case (ir `regdiff)
+			4'b0000: begin regfile[ir [7:4]] <= mainmem[regfile[ir [3:0]]]; s <= `OPadvance; end//lo
+			4'b0001: begin regfile[ir [7:4]] <= (0 - regfile[ir [3:0]]); s <= `OPadvance; end //mi
+			//ignore nl
+			4'b0011: begin regfile[ir [7:4]] <= ~(regfile[ir [3:0]]); s <= `OPadvance; end  //no
+			4'b0100: begin mainmem[regfile[ir [3:0]]] <= regfile[ir [7:4]]; s <= `OPadvance; end//st
+		endcase
+		end
+	`OPli: begin 
+			if(ir [7] == 1) begin
+				regfile[ir [11:8]] <= {8'b11111111, ir [7:0]}; s <= `OPadvance; //something broken with concatenation statements 
+			end else begin
+				regfile[ir [11:8]] <= {8'b00000000, ir [7:0]}; s <= `OPadvance; //li
+			end
+		end 
+	`OPsi: begin regfile[ir [11:8]] <= (regfile[ir [11:8]] << 8)|(ir [7:0] & 8'b11111111); s <= `OPadvance; end //si
+	`OPbr:
+		begin 
+		case (ir `dotc)
+			4'b0000:begin
+				s <= `OPadvance;	//f //write code based on if two condition regs are certain way
+				end
+			4'b0001:begin
+				if (lt == 1) pc <= (extimm + pc); 
+				s <= `OPadvance;
+				end		//lt
+			4'b0010:begin 
+				if (le == 1) pc <= (extimm + pc); 
+				s <= `OPadvance;		//le
+				end
+			4'b0011:begin 
+				if (ne == 1) pc <= (extimm + pc); 
+				s <= `OPadvance;		//ne
+				end
+			4'b0100:begin 
+				if (eq == 1) pc <= (extimm + pc);  
+				s <= `OPadvance;		//eq
+				end
+			4'b0101:begin 
+				if (ge == 1) pc <= (extimm + pc); 
+				s <= `OPadvance;		//ge
+				end
+			4'b0110:begin
+				if (gt == 1) pc <= (extimm + pc); 
+				s <= `OPadvance;		//gt
+				end
+			4'b0111:begin 
+				if (t == 1) pc <= (extimm + pc); 
+				s <= `OPadvance;	//t
+				end
+		endcase
+		end
+	`OPco:
+		begin 
+                le <= regfile[ir[3:0]] <= regfile[ir[7:4]];
+                lt <= regfile[ir[3:0]] < regfile[ir[7:4]];
+                ge <= regfile[ir[3:0]] >= regfile[ir[7:4]];
+                gt <= regfile[ir[3:0]] > regfile[ir[7:4]];
+                ne <= regfile[ir[3:0]] != regfile[ir[7:4]];
+                eq = regfile[ir[3:0]] == regfile[ir[7:4]]; 
+                s <= `OPadvance;
+		end
+	`OPjr:
+		case (ir `dotc)
+                        4'b0000:begin 
+				if (f == 0) pc <= regfile[ir [3:0]]; 
+				s <= `OPadvance;      //f //write code based on if two condition regs are certain way
+				end
+                        4'b0001:begin 
+				if (lt) pc <= regfile[ir [3:0]]; 
+				s <= `OPadvance;      //lt
+				end
+                        4'b0010:begin 
+				if (le) pc <= regfile[ir [3:0]]; 
+				s <= `OPadvance;     //le
+				end
+                        4'b0011:begin 
+				if (ne) pc <= regfile[ir [3:0]]; 
+				s <= `OPadvance;      //ne
+				end
+                        4'b0100:begin 
+				if (eq) pc <= regfile[ir [3:0]]; 
+				s <= `OPadvance;      //eq
+				end
+                        4'b0101:begin 
+				if (ge) pc <= regfile[ir [3:0]]; 
+				s <= `OPadvance;      //ge
+				end
+                        4'b0110:begin 
+				if (gt) pc <= regfile[ir [3:0]]; 
+				s <= `OPadvance;      //gt
+				end
+                        4'b0111:begin 
+				if (t == 1) pc <= regfile[ir [3:0]]; 
+				s <= `OPadvance;      //t
+				end
+		endcase
+	`OPsy: begin  halt <= 1; end
+
+
+  endcase
+end
+endmodule
+
+
+module testbench;
+reg reset = 0;
+reg clk = 0;
+wire halted;
+processor PE(halted, reset, clk);
+initial begin
+	$dumpfile;
+	$dumpvars(0, PE);
+	#10 reset = 1;
+	#10 reset = 0;
+        while (!halted) begin
+       //repeat(1024) begin
+		#10 clk = 1;
+		#10 clk = 0;
+	end
+	$finish;
+end
+endmodule
